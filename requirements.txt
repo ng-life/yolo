@@ -1,0 +1,32 @@
+# Ultralytics YOLO - SKU-110K Training + CoreML Export
+# Python >= 3.10
+# macOS (Apple Silicon or Intel) recommended for CoreML export
+
+# Core
+ultralytics>=8.3.0
+
+# CoreML export dependencies
+coremltools>=8.0
+onnx>=1.16.0
+onnxruntime>=1.19.0
+
+# Data processing (required for SKU-110K dataset download & conversion)
+numpy>=1.26.0
+polars>=0.20.0
+pillow>=10.4.0
+
+# Training utilities
+torch>=2.3.0        # torchvision is pulled automatically by ultralytics
+torchvision>=0.18.0
+
+# Logging & tracking (optional, comment out if not needed)
+# tensorboard>=2.16.0
+# wandb>=0.18.0
+# mlflow>=2.14.0
+
+# Visualization
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# Progress bars
+tqdm>=4.66.0
