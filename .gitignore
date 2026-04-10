@@ -22,8 +22,11 @@ SKU-110K/
 # Training runs (large, keep locally)
 runs/
 
+
+qdrant_data/
+
 # Model weights
-*.pt
+# *.pt
 *.onnx
 *.mlpackage
 *.engine
