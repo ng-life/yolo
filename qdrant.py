@@ -90,13 +90,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--images-root",
         type=str,
-        required=True,
+        default="./images/sku_images",
         help="SKU 图片目录，要求结构为 images_root/<sku_id>/*.jpg",
     )
     parser.add_argument(
         "--query-image",
         type=str,
-        required=True,
+        default="./images/sku_images/小爆米花.png",
         help="待检索图片路径",
     )
     parser.add_argument(

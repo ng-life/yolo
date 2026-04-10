@@ -34,8 +34,8 @@ def get_image_embedding(image_path):
     return image_embedding.cpu().numpy()
 
 # 示例：提取两张图片的向量并对比相似度
-img1_vec = get_image_embedding("/Users/ng-life/Downloads/20260408_111243.jpg")
-img2_vec = get_image_embedding("/Users/ng-life/Downloads/20260408_111243 (1).jpg")
+img1_vec = get_image_embedding("./images/20260408_111243.jpg")
+img2_vec = get_image_embedding("./images/20260408_111243 (1).jpg")
 
 # 计算余弦相似度 (简单点积即可，因为已经归一化了)
 similarity = (img1_vec @ img2_vec.T).item()

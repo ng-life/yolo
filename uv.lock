@@ -1865,6 +1865,15 @@ wheels = [
 ]
 
 [[package]]
+name = "socksio"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/5c/48a7d9495be3d1c651198fd99dbb6ce190e2274d0f28b9051307bdec6b85/socksio-1.0.0.tar.gz", hash = "sha256:f88beb3da5b5c38b9890469de67d0cb0f9d494b78b106ca1845f96c10b91c4ac", size = 19055 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/37/c3/6eeb6034408dac0fa653d126c9204ade96b819c936e136c5e8a6897eee9c/socksio-1.0.0-py3-none-any.whl", hash = "sha256:95dc1f15f9b34e8d7b16f06d74b8ccf48f609af32ab33c608d08761c5dcbb1f3", size = 12763 },
+]
+
+[[package]]
 name = "sympy"
 version = "1.13.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2125,6 +2134,7 @@ dependencies = [
     { name = "qdrant-client" },
     { name = "seaborn" },
     { name = "sentencepiece" },
+    { name = "socksio" },
     { name = "torch" },
     { name = "torchaudio" },
     { name = "torchvision" },
@@ -2150,6 +2160,7 @@ requires-dist = [
     { name = "qdrant-client", specifier = ">=1.17.1" },
     { name = "seaborn", specifier = ">=0.13.0" },
     { name = "sentencepiece", specifier = ">=0.2.1" },
+    { name = "socksio", specifier = ">=1.0.0" },
     { name = "torch", specifier = ">=2.3.0", index = "https://download.pytorch.org/whl/cu121" },
     { name = "torchaudio", specifier = ">=2.5.1", index = "https://download.pytorch.org/whl/cu121" },
     { name = "torchvision", specifier = ">=0.18.0", index = "https://download.pytorch.org/whl/cu121" },

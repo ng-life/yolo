@@ -17,5 +17,5 @@ model.set_classes([
     "bag",
     "packaging bag"])
 # 在 M4 Mac 上直接推理
-results = model.predict("/Users/ng-life/IdeaProjects/yolo/datasets/SKU-110K/images/test_0.jpg", device="mps", conf=0.05) # 使用 MPS 加速
+results = model.predict("./images/sku_images/铁观音.png", device="mps", conf=0.05) # 使用 MPS 加速
 results[0].show()
