@@ -4,7 +4,7 @@ from transformers import AutoProcessor, AutoModel
 import torch.nn.functional as F
 
 # 1. 检查设备：Mac mini M4 建议使用 mps
-device = "mps" if torch.backends.mps.is_available() else "cpu"
+device = "mps" if torch.backends.mps.is_available() else "cuda"
 print(f"使用设备: {device}")
 
 # 2. 加载模型和处理器

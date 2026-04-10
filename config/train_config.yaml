@@ -47,7 +47,7 @@ save_period: 10 # save checkpoint every N epochs  (-1 = only best/last)
 exist_ok: false
 
 # ── Hardware -------------------------------------------------------------------
-device: "mps" # "" = auto-detect (GPU > MPS > CPU)
+device: "" # "" = auto-detect (GPU > MPS > CPU)
 workers: 8 # dataloader workers
 amp: true # automatic mixed precision
 
