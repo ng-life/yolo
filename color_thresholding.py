@@ -1,11 +1,19 @@
 """
 color_thresholding.py
-使用轮廓检测与 Blob 分析，自动识别纯色背景并抠出前景物体。
+使用四种方法自动识别背景并圈出前景物体。
+
+方法对比：
+  threshold  — 全局 HSV 颜色阈值（最快，适合均匀纯色背景）
+  floodfill  — 边缘种子 Flood Fill（推荐，仅删除连通背景，不误删同色前景）
+  grabcut    — GrabCut 迭代分割（最慢但最精细，适合纹理/渐变背景）
+  edges      — Canny 边缘检测 + 膨胀闭运算（适合边缘清晰的物体；可配合 --obb 输出旋转外接框）
 
 用法:
-    uv run color_thresholding.py --input image.jpg --output result.png
-    uv run color_thresholding.py --input image.jpg --output result.png --black-threshold 80
-    uv run color_thresholding.py --input image.jpg --output result.png --padding 20 --debug
+    uv run color_thresholding.py -i image.jpg -o result.png
+    uv run color_thresholding.py -i image.jpg -o result.png --method floodfill
+    uv run color_thresholding.py -i image.jpg -o result.png --method floodfill --flood-tolerance 25
+    uv run color_thresholding.py -i image.jpg -o result.png --method grabcut --debug
+    uv run color_thresholding.py -i image.jpg -o result.png --method edges --obb
 """
 
 import argparse
@@ -113,6 +121,184 @@ def build_foreground_mask(
     return filtered
 
 
+def build_foreground_mask_grabcut(
+    image_bgr: np.ndarray,
+    border_margin: float = 0.05,
+    iterations: int = 5,
+    min_blob_area: int = 500,
+    padding: int = 0,
+    max_side: int = 400,
+) -> np.ndarray:
+    """
+    使用 GrabCut 算法生成前景掩码。
+    适用于纹理/网纹等非纯色背景。
+    内部将图像缩至 max_side 再运行 GrabCut，掩码 upscale 回原尺寸，
+    大幅降低计算量且不影响检测精度。
+    """
+    h, w = image_bgr.shape[:2]
+
+    # 内部下采样
+    gc_scale = min(1.0, max_side / max(h, w))
+    if gc_scale < 1.0:
+        gc_w = max(1, int(w * gc_scale))
+        gc_h = max(1, int(h * gc_scale))
+        gc_img = cv2.resize(image_bgr, (gc_w, gc_h), interpolation=cv2.INTER_AREA)
+    else:
+        gc_img = image_bgr
+        gc_h, gc_w = h, w
+
+    mx = max(1, int(gc_w * border_margin))
+    my = max(1, int(gc_h * border_margin))
+    rect = (mx, my, gc_w - 2 * mx, gc_h - 2 * my)
+
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+    gc_mask = np.zeros((gc_h, gc_w), np.uint8)
+
+    cv2.grabCut(gc_img, gc_mask, rect, bgd_model, fgd_model, iterations, cv2.GC_INIT_WITH_RECT)
+
+    # GC_FGD=1（确定前景）或 GC_PR_FGD=3（可能前景）均视为前景
+    small_mask = np.where((gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+
+    # upscale 回原尺寸
+    if gc_scale < 1.0:
+        mask = cv2.resize(small_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    else:
+        mask = small_mask
+
+    # 形态学填洞 + 去噪
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open,  iterations=1)
+
+    # Blob 过滤
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    filtered = np.zeros_like(mask)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_blob_area:
+            filtered[labels == i] = 255
+
+    if padding > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (padding * 2 + 1, padding * 2 + 1))
+        filtered = cv2.dilate(filtered, k, iterations=1)
+
+    return filtered[:h, :w]
+
+
+def build_foreground_mask_floodfill(
+    image_bgr: np.ndarray,
+    tolerance: int = 20,
+    min_blob_area: int = 500,
+    padding: int = 0,
+    seed_step: int = 8,
+) -> np.ndarray:
+    """
+    从图像四条边的种子点进行 Flood Fill，标记与边缘连通的背景，取反得前景掩码。
+
+    对比全局 HSV 阈值的核心优势：
+      - 仅删除与图像边缘「物理连通」的背景像素，不会误删颜色与背景
+        相同但属于前景的区域（如白背景下的白色商品标签/反光面）。
+      - 容差沿连通路径传播，天然处理轻微渐变 / 光照不均的背景。
+      - 无需预先检测背景颜色，速度与阈值法相当。
+    """
+    h, w = image_bgr.shape[:2]
+
+    # OpenCV 的 floodFill 掩码必须比图像大 2px
+    ff_mask = np.zeros((h + 2, w + 2), np.uint8)
+
+    # 从四条边每隔 seed_step 像素取一个种子
+    seeds: list[tuple[int, int]] = []
+    for x in range(0, w, seed_step):
+        seeds.append((0, x))
+        seeds.append((h - 1, x))
+    for y in range(0, h, seed_step):
+        seeds.append((y, 0))
+        seeds.append((y, w - 1))
+
+    lo = (tolerance,) * 3
+    hi = (tolerance,) * 3
+    # FLOODFILL_MASK_ONLY: 只写掩码不改图像；高 8 位指定掩码填充值 255
+    flags = cv2.FLOODFILL_MASK_ONLY | (255 << 8)
+
+    work = image_bgr.copy()  # floodFill 会修改 image 本身，用副本保护原图
+    for y, x in seeds:
+        if ff_mask[y + 1, x + 1] == 0:  # 跳过已被填充的区域，加速
+            cv2.floodFill(work, ff_mask, (x, y), (0, 0, 0), loDiff=lo, upDiff=hi, flags=flags)
+
+    # 去掉 1px 边框，还原原始坐标系；被标记的像素 = 背景
+    bg_mask = ff_mask[1:-1, 1:-1]
+    mask = cv2.bitwise_not(bg_mask)
+
+    # 形态学：填洞 + 去噪
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    kernel_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel_open,  iterations=1)
+
+    # Blob 过滤
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    filtered = np.zeros_like(mask)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_blob_area:
+            filtered[labels == i] = 255
+
+    if padding > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (padding * 2 + 1, padding * 2 + 1))
+        filtered = cv2.dilate(filtered, k, iterations=1)
+
+    return filtered[:h, :w]
+
+
+def build_foreground_mask_edges(
+    image_bgr: np.ndarray,
+    canny_lo: int = 50,
+    canny_hi: int = 150,
+    dilate_ksize: int = 15,
+    dilate_iter: int = 2,
+    blur_ksize: int = 9,
+    min_blob_area: int = 500,
+    padding: int = 0,
+) -> np.ndarray:
+    """
+    基于 Canny 边缘检测 + 形态学操作生成前景掩码。
+    适用于前景物体边缘清晰、背景纹理复杂的场景。
+
+    流程:
+      1. 转灰度 + 中值滤波消除背景细纹
+      2. Canny 边缘检测提取物体轮廓
+      3. 膨胀 + 闭运算将边缘"填实"成实心区域
+      4. Blob 过滤保留有效连通域
+    """
+    h, w = image_bgr.shape[:2]
+
+    # 1. 转灰度 + 中值滤波（核必须为奇数）
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    blur_k = blur_ksize if blur_ksize % 2 == 1 else blur_ksize + 1
+    blurred = cv2.medianBlur(gray, blur_k)
+
+    # 2. Canny 边缘检测
+    edge_map = cv2.Canny(blurred, canny_lo, canny_hi)
+
+    # 3. 膨胀 + 闭运算使商品区域"实心化"
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dilate_ksize, dilate_ksize))
+    mask = cv2.dilate(edge_map, kernel, iterations=dilate_iter)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # 4. Blob 过滤
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    filtered = np.zeros_like(mask)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_blob_area:
+            filtered[labels == i] = 255
+
+    if padding > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (padding * 2 + 1, padding * 2 + 1))
+        filtered = cv2.dilate(filtered, k, iterations=1)
+
+    return filtered[:h, :w]
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 主流程
 # ──────────────────────────────────────────────────────────────────────────────
@@ -120,11 +306,23 @@ def build_foreground_mask(
 def remove_background(
     input_path: str | Path,
     output_path: str | Path,
+    method: str = "threshold",
     color_tolerance: int = 30,
     black_threshold: int = 80,
     min_blob_area: int = 500,
     padding: int = 0,
     scale: float = 1.0,
+    grabcut_margin: float = 0.05,
+    grabcut_iter: int = 5,
+    grabcut_max_side: int = 400,
+    flood_tolerance: int = 20,
+    flood_seed_step: int = 8,
+    edges_canny_lo: int = 50,
+    edges_canny_hi: int = 150,
+    edges_dilate_ksize: int = 15,
+    edges_dilate_iter: int = 2,
+    edges_blur_ksize: int = 9,
+    draw_obb: bool = False,
     debug: bool = False,
 ) -> None:
     import time
@@ -155,39 +353,94 @@ def remove_background(
     else:
         proc_img = image_bgr
 
-    # 1. 自动检测背景颜色
-    bg_color = detect_background_color(proc_img)
-    dark = is_dark_background(bg_color, black_threshold)
-    t = _tick("检测背景颜色", t)
     print(f"[信息] 原图尺寸: {orig_w}×{orig_h}，处理尺寸: {proc_img.shape[1]}×{proc_img.shape[0]}")
-    print(f"[信息] 检测到背景颜色 BGR={bg_color.tolist()}，{'暗色背景' if dark else '亮色背景'}")
+    print(f"[信息] 分割方法: {method}{'（OBB 旋转框）' if draw_obb else ''}")
 
-    # 2. 生成前景掩码
-    mask = build_foreground_mask(
-        proc_img,
-        bg_color,
-        color_tolerance=color_tolerance,
-        black_threshold=black_threshold,
-        min_blob_area=min_blob_area,
-        padding=padding,
-    )
-    t = _tick("生成前景掩码", t)
+    # 1 & 2. 生成前景掩码
+    if method == "grabcut":
+        mask = build_foreground_mask_grabcut(
+            proc_img,
+            border_margin=grabcut_margin,
+            iterations=grabcut_iter,
+            min_blob_area=min_blob_area,
+            padding=padding,
+            max_side=grabcut_max_side,
+        )
+        t = _tick("GrabCut 分割", t)
+    elif method == "floodfill":
+        mask = build_foreground_mask_floodfill(
+            proc_img,
+            tolerance=flood_tolerance,
+            min_blob_area=min_blob_area,
+            padding=padding,
+            seed_step=flood_seed_step,
+        )
+        t = _tick("FloodFill 分割", t)
+    elif method == "edges":
+        mask = build_foreground_mask_edges(
+            proc_img,
+            canny_lo=edges_canny_lo,
+            canny_hi=edges_canny_hi,
+            dilate_ksize=edges_dilate_ksize,
+            dilate_iter=edges_dilate_iter,
+            blur_ksize=edges_blur_ksize,
+            min_blob_area=min_blob_area,
+            padding=padding,
+        )
+        t = _tick("边缘检测分割", t)
+    else:
+        bg_color = detect_background_color(proc_img)
+        dark = is_dark_background(bg_color, black_threshold)
+        t = _tick("检测背景颜色", t)
+        print(f"[信息] 检测到背景颜色 BGR={bg_color.tolist()}，{'暗色背景' if dark else '亮色背景'}")
+        mask = build_foreground_mask(
+            proc_img,
+            bg_color,
+            color_tolerance=color_tolerance,
+            black_threshold=black_threshold,
+            min_blob_area=min_blob_area,
+            padding=padding,
+        )
+        t = _tick("阈值分割", t)
 
     fg_pixels = int(np.sum(mask > 0))
     total_pixels = mask.size
     print(f"[信息] 前景像素占比: {fg_pixels / total_pixels * 100:.1f}%")
 
-    # 3. 在原图上用红色矩形圈出物品区域（坐标映射回原图尺寸）
+    # 3. 在原图上圈出物品区域（坐标映射回原图尺寸）
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     result = image_bgr.copy()
     if contours:
         all_points = np.concatenate(contours, axis=0)
-        x, y, cw, ch = cv2.boundingRect(all_points)
-        if scale != 1.0:
-            inv = 1.0 / scale
-            x, y, cw, ch = int(x * inv), int(y * inv), int(cw * inv), int(ch * inv)
-        cv2.rectangle(result, (x, y), (x + cw, y + ch), (0, 0, 255), 2)
-        print(f"[信息] 物品区域: x={x}, y={y}, w={cw}, h={ch}")
+        if draw_obb:
+            # 旋转最小外接矩形（绿色），坐标先映射回原图尺寸
+            pts = all_points.astype(np.float32)
+            if scale != 1.0:
+                pts = pts / scale
+            rect = cv2.minAreaRect(pts)
+            box = cv2.boxPoints(rect)
+            box = box.astype(int)
+            cv2.drawContours(result, [box], 0, (0, 255, 0), 2)
+            cx, cy = rect[0]
+            rw, rh = rect[1]
+            angle = rect[2]
+            print(f"[信息] 物品区域(OBB): 中心=({cx:.0f},{cy:.0f}), 尺寸={rw:.0f}×{rh:.0f}, 角度={angle:.1f}°")
+        else:
+            # 轴对齐外接矩形（红色）
+            x, y, cw, ch = cv2.boundingRect(all_points)
+            if scale != 1.0:
+                inv = 1.0 / scale
+                x2 = x + cw
+                y2 = y + ch
+                # 左上角 floor（往外扩），右下角 ceil（往外扩），确保不漏掉边缘像素
+                x  = max(0, int(np.floor(x  * inv)))
+                y  = max(0, int(np.floor(y  * inv)))
+                x2 = min(orig_w, int(np.ceil(x2 * inv)))
+                y2 = min(orig_h, int(np.ceil(y2 * inv)))
+                cw = x2 - x
+                ch = y2 - y
+            cv2.rectangle(result, (x, y), (x + cw, y + ch), (0, 0, 255), 2)
+            print(f"[信息] 物品区域: x={x}, y={y}, w={cw}, h={ch}")
     else:
         print("[警告] 未检测到前景物品")
     t = _tick("轮廓检测+绘框", t)
@@ -219,6 +472,19 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--input",  "-i", required=True,  help="输入图像路径")
     p.add_argument("--output", "-o", required=True,  help="输出图像路径（原图 + 红色物品检测框）")
+    p.add_argument("--method", choices=["threshold", "grabcut", "floodfill", "edges"], default="threshold",
+                   help="分割方法：threshold=颜色阈值（纯色背景）；grabcut=GrabCut（纹理背景）；"
+                        "floodfill=边缘种子洪泛（推荐）；edges=Canny 边缘检测（适合边缘清晰的物体）")
+    p.add_argument("--flood-tolerance", type=int, default=20,
+                   help="floodfill 方法的像素颜色容差（0-60），值越大扩散越激进")
+    p.add_argument("--flood-seed-step", type=int, default=8,
+                   help="floodfill 方法边缘种子点间距（px），越小越密但更慢")
+    p.add_argument("--grabcut-margin", type=float, default=0.05,
+                   help="GrabCut 边缘背景先验区域比例（0.0-0.2）")
+    p.add_argument("--grabcut-iter", type=int, default=5,
+                   help="GrabCut 迭代次数，越多越精确但越慢")
+    p.add_argument("--grabcut-max-side", type=int, default=400,
+                   help="GrabCut 内部处理图像的最大边长（px），越小越快；建议 200-600")
     p.add_argument("--color-tolerance", type=int, default=30,
                    help="背景颜色容差（HSV 色调偏差，0-90）")
     p.add_argument("--black-threshold",  type=int, default=80,
@@ -231,6 +497,16 @@ def parse_args() -> argparse.Namespace:
                    help="处理前缩放比例（0.0-1.0），越小越快，检测精度略降；结果绘在原图上")
     p.add_argument("--debug", action="store_true",
                    help="保存掩码和轮廓可视化图（输出在 <output_dir>/debug/）")
+    p.add_argument("--obb", action="store_true",
+                   help="绘制旋转最小外接矩形（OBB，绿色）而非轴对齐矩形（红色）；适合倾斜物体")
+    p.add_argument("--canny-lo", type=int, default=50,
+                   help="edges 方法：Canny 低阈值（0-255）")
+    p.add_argument("--canny-hi", type=int, default=150,
+                   help="edges 方法：Canny 高阈值（0-255），通常为低阈值的 2-3 倍")
+    p.add_argument("--dilate-ksize", type=int, default=15,
+                   help="edges 方法：膨胀/闭运算核大小（px），越大越能填实内部空洞")
+    p.add_argument("--dilate-iter", type=int, default=2,
+                   help="edges 方法：膨胀迭代次数")
     return p.parse_args()
 
 
@@ -239,10 +515,21 @@ if __name__ == "__main__":
     remove_background(
         input_path=args.input,
         output_path=args.output,
+        method=args.method,
         color_tolerance=args.color_tolerance,
         black_threshold=args.black_threshold,
         min_blob_area=args.min_blob_area,
         padding=args.padding,
         scale=args.scale,
+        grabcut_margin=args.grabcut_margin,
+        grabcut_iter=args.grabcut_iter,
+        grabcut_max_side=args.grabcut_max_side,
+        flood_tolerance=args.flood_tolerance,
+        flood_seed_step=args.flood_seed_step,
+        edges_canny_lo=args.canny_lo,
+        edges_canny_hi=args.canny_hi,
+        edges_dilate_ksize=args.dilate_ksize,
+        edges_dilate_iter=args.dilate_iter,
+        draw_obb=args.obb,
         debug=args.debug,
     )
