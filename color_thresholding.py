@@ -24,6 +24,51 @@ import cv2
 import numpy as np
 
 
+def order_box_points(points: np.ndarray) -> np.ndarray:
+    """将四个顶点排序为左上、右上、右下、左下。"""
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s = points.sum(axis=1)
+    diff = np.diff(points, axis=1)
+
+    rect[0] = points[np.argmin(s)]
+    rect[2] = points[np.argmax(s)]
+    rect[1] = points[np.argmin(diff)]
+    rect[3] = points[np.argmax(diff)]
+    return rect
+
+
+def crop_rotated_rect(image_bgr: np.ndarray, rect: tuple) -> np.ndarray | None:
+    """按旋转矩形做透视矫正，返回摆正后的裁剪图。"""
+    box = cv2.boxPoints(rect).astype(np.float32)
+    src_pts = order_box_points(box)
+
+    width_a = np.linalg.norm(src_pts[2] - src_pts[3])
+    width_b = np.linalg.norm(src_pts[1] - src_pts[0])
+    height_a = np.linalg.norm(src_pts[1] - src_pts[2])
+    height_b = np.linalg.norm(src_pts[0] - src_pts[3])
+
+    dst_w = max(1, int(round(max(width_a, width_b))))
+    dst_h = max(1, int(round(max(height_a, height_b))))
+
+    if dst_w <= 1 or dst_h <= 1:
+        return None
+
+    dst_pts = np.array([
+        [0, 0],
+        [dst_w - 1, 0],
+        [dst_w - 1, dst_h - 1],
+        [0, dst_h - 1],
+    ], dtype=np.float32)
+
+    matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    warped = cv2.warpPerspective(image_bgr, matrix, (dst_w, dst_h))
+
+    if warped.shape[0] > warped.shape[1]:
+        warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
+
+    return warped
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 背景颜色自动识别
 # ──────────────────────────────────────────────────────────────────────────────
@@ -407,24 +452,27 @@ def remove_background(
     total_pixels = mask.size
     print(f"[信息] 前景像素占比: {fg_pixels / total_pixels * 100:.1f}%")
 
-    # 3. 在原图上圈出物品区域（坐标映射回原图尺寸）
+    # 3. 根据前景区域输出结果（坐标映射回原图尺寸）
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     result = image_bgr.copy()
     if contours:
         all_points = np.concatenate(contours, axis=0)
         if draw_obb:
-            # 旋转最小外接矩形（绿色），坐标先映射回原图尺寸
+            # 旋转最小外接矩形，坐标先映射回原图尺寸，再输出摆正裁剪结果
             pts = all_points.astype(np.float32)
             if scale != 1.0:
                 pts = pts / scale
             rect = cv2.minAreaRect(pts)
-            box = cv2.boxPoints(rect)
-            box = box.astype(int)
-            cv2.drawContours(result, [box], 0, (0, 255, 0), 2)
             cx, cy = rect[0]
             rw, rh = rect[1]
             angle = rect[2]
             print(f"[信息] 物品区域(OBB): 中心=({cx:.0f},{cy:.0f}), 尺寸={rw:.0f}×{rh:.0f}, 角度={angle:.1f}°")
+
+            cropped = crop_rotated_rect(image_bgr, rect)
+            if cropped is None:
+                print("[警告] OBB 裁剪失败，退回输出原图")
+            else:
+                result = cropped
         else:
             # 轴对齐外接矩形（红色）
             x, y, cw, ch = cv2.boundingRect(all_points)
@@ -443,7 +491,7 @@ def remove_background(
             print(f"[信息] 物品区域: x={x}, y={y}, w={cw}, h={ch}")
     else:
         print("[警告] 未检测到前景物品")
-    t = _tick("轮廓检测+绘框", t)
+    t = _tick("轮廓检测+结果生成", t)
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(dst), result)
@@ -471,7 +519,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--input",  "-i", required=True,  help="输入图像路径")
-    p.add_argument("--output", "-o", required=True,  help="输出图像路径（原图 + 红色物品检测框）")
+    p.add_argument("--output", "-o", required=True,  help="输出图像路径")
     p.add_argument("--method", choices=["threshold", "grabcut", "floodfill", "edges"], default="threshold",
                    help="分割方法：threshold=颜色阈值（纯色背景）；grabcut=GrabCut（纹理背景）；"
                         "floodfill=边缘种子洪泛（推荐）；edges=Canny 边缘检测（适合边缘清晰的物体）")
@@ -498,7 +546,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--debug", action="store_true",
                    help="保存掩码和轮廓可视化图（输出在 <output_dir>/debug/）")
     p.add_argument("--obb", action="store_true",
-                   help="绘制旋转最小外接矩形（OBB，绿色）而非轴对齐矩形（红色）；适合倾斜物体")
+                   help="使用旋转最小外接矩形（OBB）将物体摆正并输出裁剪结果；适合倾斜物体")
     p.add_argument("--canny-lo", type=int, default=50,
                    help="edges 方法：Canny 低阈值（0-255）")
     p.add_argument("--canny-hi", type=int, default=150,
