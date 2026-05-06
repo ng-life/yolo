@@ -10,10 +10,11 @@ color_thresholding.py
 
 用法:
     uv run color_thresholding.py -i image.jpg -o result.png
-    uv run color_thresholding.py -i image.jpg -o result.png --method floodfill
-    uv run color_thresholding.py -i image.jpg -o result.png --method floodfill --flood-tolerance 25
-    uv run color_thresholding.py -i image.jpg -o result.png --method grabcut --debug
-    uv run color_thresholding.py -i image.jpg -o result.png --method edges --obb
+    uv run color_thresholding.py -i image.jpg --method floodfill
+    uv run color_thresholding.py -i image.jpg --method floodfill --flood-tolerance 25
+    uv run color_thresholding.py -i image.jpg --method grabcut --debug
+    uv run color_thresholding.py -i image.jpg --method edges --obb
+    uv run color_thresholding.py -i /path/to/images --method edges --obb
 """
 
 import argparse
@@ -22,6 +23,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 def order_box_points(points: np.ndarray) -> np.ndarray:
@@ -37,8 +41,20 @@ def order_box_points(points: np.ndarray) -> np.ndarray:
     return rect
 
 
+def extract_primary_contour(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+    """提取最大外轮廓及其填充掩码，忽略周围小杂物。"""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, None
+
+    primary_contour = max(contours, key=cv2.contourArea)
+    primary_mask = np.zeros_like(mask)
+    cv2.drawContours(primary_mask, [primary_contour], -1, 255, thickness=cv2.FILLED)
+    return primary_contour, primary_mask
+
+
 def crop_rotated_rect(image_bgr: np.ndarray, rect: tuple) -> np.ndarray | None:
-    """按旋转矩形做透视矫正，返回摆正后的裁剪图。"""
+    """按旋转矩形做透视矫正，返回摆正后的 OBB 区域原图内容。结果保持竖向，高大于宽，并额外旋转 180 度。"""
     box = cv2.boxPoints(rect).astype(np.float32)
     src_pts = order_box_points(box)
 
@@ -61,12 +77,105 @@ def crop_rotated_rect(image_bgr: np.ndarray, rect: tuple) -> np.ndarray | None:
     ], dtype=np.float32)
 
     matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
-    warped = cv2.warpPerspective(image_bgr, matrix, (dst_w, dst_h))
+    result = cv2.warpPerspective(image_bgr, matrix, (dst_w, dst_h))
 
-    if warped.shape[0] > warped.shape[1]:
-        warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
+    if result.shape[1] > result.shape[0]:
+        result = cv2.rotate(result, cv2.ROTATE_90_CLOCKWISE)
 
-    return warped
+    result = cv2.rotate(result, cv2.ROTATE_180)
+
+    return result
+
+
+def iter_input_images(input_path: Path) -> list[Path]:
+    """返回待处理图片列表，支持单图或目录。"""
+    if input_path.is_file():
+        return [input_path]
+
+    if input_path.is_dir():
+        return sorted(
+            path for path in input_path.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+
+    sys.exit(f"[错误] 输入路径不存在: {input_path}")
+
+
+def build_output_path(input_file: Path, output_path: str | Path | None, draw_obb: bool, is_batch: bool) -> Path:
+    """生成输出路径。批处理时输出到原目录，文件名为 原文件名_obb.jpg。"""
+    if is_batch or output_path is None:
+        suffix = "_obb.jpg" if draw_obb else "_result" + input_file.suffix
+        return input_file.with_name(input_file.stem + suffix)
+
+    output = Path(output_path)
+    if output.is_dir():
+        suffix = ".jpg" if draw_obb else input_file.suffix
+        name = input_file.stem + ("_obb" if draw_obb else "_result") + suffix
+        return output / name
+
+    return output
+
+
+def save_image(output_path: Path, image: np.ndarray) -> None:
+    """保存图像。"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cv2.imwrite(str(output_path), image)
+
+
+def process_image(
+    input_path: str | Path,
+    output_path: str | Path | None,
+    method: str = "threshold",
+    color_tolerance: int = 30,
+    black_threshold: int = 80,
+    min_blob_area: int = 500,
+    padding: int = 0,
+    scale: float = 1.0,
+    grabcut_margin: float = 0.05,
+    grabcut_iter: int = 5,
+    grabcut_max_side: int = 400,
+    flood_tolerance: int = 20,
+    flood_seed_step: int = 8,
+    edges_canny_lo: int = 50,
+    edges_canny_hi: int = 150,
+    edges_dilate_ksize: int = 15,
+    edges_dilate_iter: int = 2,
+    edges_blur_ksize: int = 9,
+    draw_obb: bool = False,
+    debug: bool = False,
+) -> None:
+    src = Path(input_path)
+    files = iter_input_images(src)
+    if not files:
+        sys.exit(f"[错误] 未在目录中找到可处理图片: {src}")
+
+    is_batch = src.is_dir()
+    print(f"[信息] 待处理图片数: {len(files)}")
+    for file_path in files:
+        dst = build_output_path(file_path, output_path, draw_obb, is_batch)
+        remove_background(
+            input_path=file_path,
+            output_path=dst,
+            method=method,
+            color_tolerance=color_tolerance,
+            black_threshold=black_threshold,
+            min_blob_area=min_blob_area,
+            padding=padding,
+            scale=scale,
+            grabcut_margin=grabcut_margin,
+            grabcut_iter=grabcut_iter,
+            grabcut_max_side=grabcut_max_side,
+            flood_tolerance=flood_tolerance,
+            flood_seed_step=flood_seed_step,
+            edges_canny_lo=edges_canny_lo,
+            edges_canny_hi=edges_canny_hi,
+            edges_dilate_ksize=edges_dilate_ksize,
+            edges_dilate_iter=edges_dilate_iter,
+            edges_blur_ksize=edges_blur_ksize,
+            draw_obb=draw_obb,
+            debug=debug,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -453,13 +562,12 @@ def remove_background(
     print(f"[信息] 前景像素占比: {fg_pixels / total_pixels * 100:.1f}%")
 
     # 3. 根据前景区域输出结果（坐标映射回原图尺寸）
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     result = image_bgr.copy()
-    if contours:
-        all_points = np.concatenate(contours, axis=0)
+    primary_contour, primary_mask = extract_primary_contour(mask)
+    if primary_contour is not None and primary_mask is not None:
         if draw_obb:
             # 旋转最小外接矩形，坐标先映射回原图尺寸，再输出摆正裁剪结果
-            pts = all_points.astype(np.float32)
+            pts = primary_contour.astype(np.float32)
             if scale != 1.0:
                 pts = pts / scale
             rect = cv2.minAreaRect(pts)
@@ -475,7 +583,7 @@ def remove_background(
                 result = cropped
         else:
             # 轴对齐外接矩形（红色）
-            x, y, cw, ch = cv2.boundingRect(all_points)
+            x, y, cw, ch = cv2.boundingRect(primary_contour)
             if scale != 1.0:
                 inv = 1.0 / scale
                 x2 = x + cw
@@ -493,8 +601,7 @@ def remove_background(
         print("[警告] 未检测到前景物品")
     t = _tick("轮廓检测+结果生成", t)
 
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(dst), result)
+    save_image(dst, result)
     t = _tick("保存图像", t)
 
     total = time.perf_counter() - t0
@@ -518,8 +625,8 @@ def parse_args() -> argparse.Namespace:
         description="自动识别纯色背景并抠出前景（轮廓检测 + Blob 分析）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--input",  "-i", required=True,  help="输入图像路径")
-    p.add_argument("--output", "-o", required=True,  help="输出图像路径")
+    p.add_argument("--input",  "-i", required=True,  help="输入图像或目录路径")
+    p.add_argument("--output", "-o", help="输出图像路径；省略时自动输出到原目录")
     p.add_argument("--method", choices=["threshold", "grabcut", "floodfill", "edges"], default="threshold",
                    help="分割方法：threshold=颜色阈值（纯色背景）；grabcut=GrabCut（纹理背景）；"
                         "floodfill=边缘种子洪泛（推荐）；edges=Canny 边缘检测（适合边缘清晰的物体）")
@@ -546,7 +653,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--debug", action="store_true",
                    help="保存掩码和轮廓可视化图（输出在 <output_dir>/debug/）")
     p.add_argument("--obb", action="store_true",
-                   help="使用旋转最小外接矩形（OBB）将物体摆正并输出裁剪结果；适合倾斜物体")
+                   help="使用旋转最小外接矩形（OBB）将物体摆正，只保留商品主体并输出透明 PNG")
     p.add_argument("--canny-lo", type=int, default=50,
                    help="edges 方法：Canny 低阈值（0-255）")
     p.add_argument("--canny-hi", type=int, default=150,
@@ -560,7 +667,7 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    remove_background(
+    process_image(
         input_path=args.input,
         output_path=args.output,
         method=args.method,
